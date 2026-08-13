@@ -1191,9 +1191,9 @@ end
 local function irreducibleRegions(g,dom)
     -- Tarjan SCC + entry counting. SCCs with >1 external entry are
     -- irreducible. We preserve them with an explicit dispatcher fallback.
-    local index,stack,on={}, {}, {}, {}; local idx=0; local sccs={}
+    local index,stack,on,low={}, {}, {}, {}; local idx=0; local sccs={}
     local function visit(v)
-        idx = idx + 1; index[v]=idx; low={[v]=idx}; stack[#stack+1]=v; on[v]=true
+        idx = idx + 1 index[v] = idx low[v] = idx stack[#stack+1] = v on[v] = true
         for _,w in ipairs(g.blocks[v].successors) do
             if not index[w] then visit(w); low[v]=math.min(low[v],low[w])
             elseif on[w] then low[v]=math.min(low[v],index[w]) end
