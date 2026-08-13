@@ -5,7 +5,7 @@
 -- Original implementation; not copied from Oracle, Lua.Expert, Konstant, or Medal.
 
 local m0pu = {}
-m0pu.VERSION = "6.1.0"
+m0pu.VERSION = "6.1.1"
 m0pu.BYTECODE_MIN, m0pu.BYTECODE_MAX = 3, 12
 
 local bit32 = bit32
@@ -294,8 +294,8 @@ end
 
 
 -- ============================================================================
--- m0pu
--- Deterministic Luau bytecode analysis and source-recovery runtime.
+-- m0pu Decompiler v5 PRO
+-- A deterministic Luau decompiler middle-end.
 --
 -- Design:
 --   serialized bytecode
@@ -309,8 +309,8 @@ end
 --      -> Luau source
 --
 -- No network calls, no LLM dependency, no textual "AI correction", and no
--- Unsupported instructions remain explicit IR nodes and are diagnosed; source
--- emission never invents executable semantics.
+-- fabricated source for unsupported semantics.  Unsupported instructions are
+-- preserved as explicit IR nodes and reported diagnostically.
 -- ============================================================================
 
 m0pu.VERSION = "6.1.0"
@@ -1189,27 +1189,80 @@ local function loopShape(g,loops,ipdom)
 end
 
 local function irreducibleRegions(g,dom)
-    -- Tarjan SCC + entry counting. SCCs with >1 external entry are
-    -- irreducible. We preserve them with an explicit dispatcher fallback.
-    local index,stack,on,low={}, {}, {}, {}; local idx=0; local sccs={}
+    -- Tarjan SCC + entry counting. SCC state is shared across the complete
+    -- traversal; keeping low-link values outside visit() is essential.
+    -- Malformed/out-of-range CFG edges are ignored here rather than turning
+    -- analysis into an unrelated nil-index crash.
+    local index,low,stack,on={}, {}, {}, {}
+    local idx=0
+    local sccs={}
+
     local function visit(v)
-        idx = idx + 1 index[v] = idx low[v] = idx stack[#stack+1] = v on[v] = true
-        for _,w in ipairs(g.blocks[v].successors) do
-            if not index[w] then visit(w); low[v]=math.min(low[v],low[w])
-            elseif on[w] then low[v]=math.min(low[v],index[w]) end
+        if type(v)~="number" or not g.blocks[v] or index[v] then return end
+
+        idx=idx+1
+        index[v]=idx
+        low[v]=idx
+        stack[#stack+1]=v
+        on[v]=true
+
+        local block=g.blocks[v]
+        for _,w in ipairs(block.successors or {}) do
+            if type(w)=="number" and g.blocks[w] then
+                if not index[w] then
+                    visit(w)
+                    local childLow=low[w]
+                    if childLow~=nil and childLow<low[v] then
+                        low[v]=childLow
+                    end
+                elseif on[w] then
+                    local wi=index[w]
+                    if wi<low[v] then
+                        low[v]=wi
+                    end
+                end
+            end
         end
+
         if low[v]==index[v] then
-            local comp={}; repeat local w=stack[#stack]; stack[#stack]=nil; on[w]=nil; comp[#comp+1]=w until w==v; sccs[#sccs+1]=comp end
+            local comp={}
+            while true do
+                local w=stack[#stack]
+                stack[#stack]=nil
+                on[w]=nil
+                comp[#comp+1]=w
+                if w==v then break end
+            end
+            sccs[#sccs+1]=comp
+        end
     end
-    visit(g.entry.id)
+
+    if g.entry and g.entry.id then
+        visit(g.entry.id)
+    end
+
     local bad={}
     for _,comp in ipairs(sccs) do
         if #comp>1 then
-            local members={}; for _,x in ipairs(comp) do members[x]=true end
+            local members={}
+            for _,x in ipairs(comp) do members[x]=true end
+
             local entries={}
-            for _,x in ipairs(comp) do for _,pred in ipairs(g.blocks[x].predecessors) do if not members[pred] then entries[x]=true end end end
-            local n=0; for _ in pairs(entries) do n=n+1 end
-            if n>1 then bad[#bad+1]={members=comp,entries=entries} end
+            for _,x in ipairs(comp) do
+                local block=g.blocks[x]
+                for _,pred in ipairs(block.predecessors or {}) do
+                    if not members[pred] then
+                        entries[x]=true
+                        break
+                    end
+                end
+            end
+
+            local n=0
+            for _ in pairs(entries) do n=n+1 end
+            if n>1 then
+                bad[#bad+1]={members=comp,entries=entries} 
+            end
         end
     end
     return bad
@@ -1531,7 +1584,8 @@ function Structurer:emitBlockInstructions(b)
                 out[#out+1]=L(ins.A).." = "..rhs
             end
         else
-            error(("m0pu: no source lowering is available for opcode %s at PC %d"):format(n, ins.pc), 0)
+            self.warnings[#self.warnings+1]="unsupported source emission for "..n.." at PC "..ins.pc
+            out[#out+1]="--[[ m0pu: unsupported opcode "..n.." at PC "..ins.pc.." ]]"
         end
     end
     return out
@@ -1958,14 +2012,8 @@ function m0pu.analyze(bytecode,options)
             ssaValues=x.ir.nextId,phis=0,loops=#x.loops,warnings=#x.diagnostics.warnings,
             confidence=x.confidence,irreducibleRegions=x.diagnostics.facts.irreducibleRegions or 0,
             shortCircuitRegions=x.diagnostics.facts.shortCircuitRegions or 0}
-        for _,b in ipairs(x.cfg.blocks) do
-            r.protos[p.id].edges=r.protos[p.id].edges+#b.successors
-        end
-        for _,regs in pairs(x.ir.phis) do
-            for _ in pairs(regs) do
-                r.protos[p.id].phis=r.protos[p.id].phis+1
-            end
-        end
+        for _,b in ipairs(x.cfg.blocks) do r.protos[p.id].edges=edges+#b.successors end
+        for _,regs in pairs(x.ir.phis) do for _ in pairs(regs) do r.protos[p.id].phis=phis+1 end end
     end
     return r
 end
@@ -1984,7 +2032,7 @@ function m0pu.decompile(input,options)
     local c=prepare(data,options)
     local analyses={}
     -- Analyze children first so closure expression reconstruction can embed
-    -- their already-recovered bodies instead of synthesizing an empty function.
+    -- their already-recovered bodies instead of a placeholder function.
     for _,p in ipairs(c.protos or {}) do
         if p.id~=c.main.id then
             local ok,res=pcall(analyzeProto,p,options)
