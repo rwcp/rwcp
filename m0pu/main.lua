@@ -305,7 +305,7 @@ local function parseLuau(data,options)
 
         if r:u8()~=0 then
             p.linegaplog2=r:u8()
-            local intervals=((nc-1) >> p.linegaplog2)+1
+            local intervals=math.floor((nc-1)/(2 ^ p.linegaplog2))+1
             p.lineinfo={}
             local last=0
             for pc=1,nc do
