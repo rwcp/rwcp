@@ -5,7 +5,7 @@
 -- Original implementation; not copied from Oracle, Lua.Expert, Konstant, or Medal.
 
 local m0pu = {}
-m0pu.VERSION = "6.1.1"
+m0pu.VERSION = "6.1.2"
 m0pu.BYTECODE_MIN, m0pu.BYTECODE_MAX = 3, 12
 
 local bit32 = bit32
@@ -261,7 +261,7 @@ local function parseLuau(data,options)
         return p
     end
     for i=1,np do protos[i]=parseProto(i) end
-    local main=r:varint(); c.protos=protos; c.main=protos[main+1]; c.bytesConsumed=r.p-1; c.trailing=r:remaining()
+    local main=r:varint(); c.protos=protos; c.main=protos[main+1]; if not c.main then error(("invalid main proto index %d (proto count %d)"):format(main,#protos)) end; c.bytesConsumed=r.p-1; c.trailing=r:remaining()
     return c
 end
 
@@ -283,12 +283,32 @@ local function parseLegacy(data)
     return {format="LegacyM0pu",bytecodeVersion=0,typeVersion=0,protos={},main=proto()}
 end
 local function parseAny(data,options)
+    options=options or {}
     local first=string.byte(data,1) or 0
+
+    -- A blob whose first byte is a supported Luau bytecode version is a
+    -- serialized Luau chunk.  Never reinterpret a failed Luau parse as the
+    -- legacy format: doing so turns serialization metadata into fake opcodes.
     if first>=3 and first<=12 then
         local ok,res=pcall(parseLuau,data,options)
-        if ok then return res end
-        if options and options.strict then error(res,0) end
+        if not ok then
+            error(("Luau bytecode v%d parse failed: %s"):format(first,tostring(res)),0)
+        end
+        if not res.main then
+            error(("Luau bytecode v%d contains no main prototype"):format(first),0)
+        end
+        return res
     end
+
+    if first==0 then
+        local ok,res=pcall(parseLuau,data,options)
+        if ok and res.error then return res end
+    end
+
+    if options.strict then
+        error(("unsupported bytecode container/version byte 0x%02X"):format(first),0)
+    end
+
     return parseLegacy(data)
 end
 
@@ -313,7 +333,7 @@ end
 -- preserved as explicit IR nodes and reported diagnostically.
 -- ============================================================================
 
-m0pu.VERSION = "6.1.1"
+m0pu.VERSION = "6.1.2"
 
 local function push(t, v) t[#t+1] = v; return v end
 local function copyMap(s)
