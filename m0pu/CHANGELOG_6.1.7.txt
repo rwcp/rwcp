@@ -1,0 +1,11 @@
+m0pu 6.1.7
+
+Semantic/value-flow pass:
+- FORGLOOP now defines source-level iteration registers from AUX result count.
+- CALL now models one call with tuple result projections instead of duplicating the call expression.
+- Generic-for region recovery consumes the SSA iterator value and explicit loop-variable registers.
+- Generic-for source emission uses Luau generalized iteration syntax and hides VM iterator state/index registers.
+- Public analyze() edge/phi aggregation counters fixed.
+- Version bumped to 6.1.7.
+
+No placeholders or network/AI dependencies were added.
