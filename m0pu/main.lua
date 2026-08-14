@@ -5,7 +5,7 @@
 -- Original implementation; not copied from Oracle, Lua.Expert, Konstant, or Medal.
 
 local m0pu = {}
-m0pu.VERSION = "6.1.7"
+m0pu.VERSION = "6.1.8"
 m0pu.BYTECODE_MIN, m0pu.BYTECODE_MAX = 3, 12
 
 local bit32 = bit32
@@ -143,12 +143,56 @@ local OPCODES={"NOP",
 local function opname(i) return OPCODES[i+1] or ("OP_"..i) end
 local AUX={}
 for _,n in ipairs({
-    "GETGLOBAL","GETIMPORT","GETTABLEKS","SETTABLEKS","NAMECALL","NEWTABLE","SETLIST",
+    "GETGLOBAL","GETIMPORT","LOADKX","GETTABLEKS","SETTABLEKS","NAMECALL","NEWTABLE","SETLIST",
     "FORGLOOP","FASTCALL2","FASTCALL2K","FASTCALL3","JUMPXEQKNIL","JUMPXEQKB",
     "JUMPXEQKN","JUMPXEQKS","GETUDATAKS","SETUDATAKS","NAMECALLUDATA",
     "NEWCLASSMEMBER","CALLFB","CMPPROTO"
 }) do AUX[n]=true end
 local function oplen(n) return AUX[n] and 2 or 1 end
+
+-- Roblox serializes Luau instructions through its BytecodeEncoder hook.
+-- The opcode byte is transformed by x -> (x * 227) mod 256; 203 is the
+-- modular inverse of 227. Operands and AUX words remain unchanged.
+local ROBLOX_OP_ENCODER = 227
+local ROBLOX_OP_DECODER = 203
+
+local function decodeOpcodeByte(op, robloxEncoded)
+    if robloxEncoded then
+        return band(op * ROBLOX_OP_DECODER, 0xff)
+    end
+    return op
+end
+
+local function decodeWord(w, robloxEncoded)
+    local rawop=band(w,0xff)
+    local op=decodeOpcodeByte(rawop,robloxEncoded)
+    local A=band(rshift(w,8),0xff)
+    local B=band(rshift(w,16),0xff)
+    local C=band(rshift(w,24),0xff)
+    local D=rshift(w,16); if D>=0x8000 then D=D-0x10000 end
+    local E=rshift(w,8); if E>=0x800000 then E=E-0x1000000 end
+    return {word=w,rawop=rawop,op=op,name=opname(op),A=A,B=B,C=C,D=D,E=E,robloxEncoded=robloxEncoded}
+end
+
+local function scoreOpcodeEncoding(words, robloxEncoded)
+    local valid,invalid=0,0
+    local sample=math.min(#words,64)
+    for i=1,sample do
+        local raw=band(words[i],0xff)
+        local op=decodeOpcodeByte(raw,robloxEncoded)
+        if op<#OPCODES then valid=valid+1 else invalid=invalid+1 end
+    end
+    return valid,invalid
+end
+
+local function chooseOpcodeEncoding(words,options)
+    if options and options.roblox==true then return true end
+    if options and options.roblox==false then return false end
+    local rv=scoreOpcodeEncoding(words,false)
+    local bv=scoreOpcodeEncoding(words,true)
+    if bv>rv and (bv-rv)>=2 then return true end
+    return false
+end
 
 local function decodeWord(w)
     local op=band(w,0xff); local A=band(rshift(w,8),0xff); local B=band(rshift(w,16),0xff); local C=band(rshift(w,24),0xff)
@@ -210,7 +254,12 @@ local function parseLuau(data,options)
             p.typeinfo=ts>0 and r:bytes(ts) or nil
         end
         local nc=r:varint(); p.code={}
-        for pc=1,nc do p.code[pc]=decodeWord(r:u32()) end
+        local rawCode={}
+        for pc=1,nc do rawCode[pc]=r:u32() end
+        local robloxEncoded=chooseOpcodeEncoding(rawCode,options)
+        p.robloxEncoded=robloxEncoded
+        p.codeEncoding=robloxEncoded and "RobloxOpcodeEncoder(227)" or "LuauNative"
+        for pc=1,nc do p.code[pc]=decodeWord(rawCode[pc],robloxEncoded) end
         local nk=r:varint()
         for i=1,nk do
             local tag=r:u8(); local k={tag=tag,type=CT[tag] or ("tag"..tag)}
@@ -333,7 +382,7 @@ end
 -- preserved as explicit IR nodes and reported diagnostically.
 -- ============================================================================
 
-m0pu.VERSION = "6.1.7"
+m0pu.VERSION = "6.1.8"
 
 local function push(t, v) t[#t+1] = v; return v end
 local function copyMap(s)
@@ -2046,7 +2095,7 @@ function m0pu.disassemble(bytecode,options)
     local c=parseAny(bytecode,options or {})
     local out={"-- m0pu "..m0pu.VERSION.." | "..c.format.." | bytecode "..c.bytecodeVersion}
     for _,p in ipairs(c.protos or {}) do
-        out[#out+1]="-- proto "..p.id.." "..quote(p.debugname or "")
+        out[#out+1]="-- proto "..p.id.." "..quote(p.debugname or "").." | encoding="..tostring(p.codeEncoding or "LuauNative")
         local pc=1
         while pc<=#p.code do
             local i=p.code[pc]
@@ -2069,7 +2118,7 @@ function m0pu.analyze(bytecode,options)
         bytes=#bytecode,protos={}}
     for _,p in ipairs(c.protos or {}) do
         local x=analyzeProto(p,options)
-        r.protos[p.id]={instructions=#p.code,blocks=#x.cfg.blocks,edges=0,
+        r.protos[p.id]={instructions=#p.code,blocks=#x.cfg.blocks,edges=0,encoding=p.codeEncoding or "LuauNative",robloxEncoded=p.robloxEncoded==true,
             ssaValues=x.ir.nextId,phis=0,loops=#x.loops,warnings=#x.diagnostics.warnings,
             confidence=x.confidence,irreducibleRegions=x.diagnostics.facts.irreducibleRegions or 0,
             shortCircuitRegions=x.diagnostics.facts.shortCircuitRegions or 0}
