@@ -5,7 +5,7 @@
 -- Original implementation; not copied from Oracle, Lua.Expert, Konstant, or Medal.
 
 local m0pu = {}
-m0pu.VERSION = "6.1.2"
+m0pu.VERSION = "6.1.3"
 m0pu.BYTECODE_MIN, m0pu.BYTECODE_MAX = 3, 12
 
 local bit32 = bit32
@@ -143,7 +143,7 @@ local OPCODES={"NOP",
 local function opname(i) return OPCODES[i+1] or ("OP_"..i) end
 local AUX={}
 for _,n in ipairs({
-    "GETGLOBAL","GETIMPORT","GETTABLEKS","SETTABLEKS","NAMECALL","NEWTABLE","SETLIST",
+    "GETGLOBAL","GETIMPORT","LOADKX","GETTABLEKS","SETTABLEKS","NAMECALL","NEWTABLE","SETLIST",
     "FORGLOOP","FASTCALL2","FASTCALL2K","FASTCALL3","JUMPXEQKNIL","JUMPXEQKB",
     "JUMPXEQKN","JUMPXEQKS","GETUDATAKS","SETUDATAKS","NAMECALLUDATA",
     "NEWCLASSMEMBER","CALLFB","CMPPROTO"
@@ -188,80 +188,169 @@ local function parseLuau(data,options)
     local c={format="LuauSerialized",bytecodeVersion=r:u8(),typeVersion=0,strings={},protos={},warnings={}}
     if c.bytecodeVersion==0 then c.error=r:bytes(r:remaining()); return c end
     assert(c.bytecodeVersion>=3 and c.bytecodeVersion<=12,"unsupported Luau bytecode version "..c.bytecodeVersion)
-    if c.bytecodeVersion>=4 then c.typeVersion=r:u8(); assert(c.typeVersion>=1 and c.typeVersion<=3,"unsupported Luau type version "..c.typeVersion) end
+    if c.bytecodeVersion>=4 then
+        c.typeVersion=r:u8()
+        assert(c.typeVersion>=1 and c.typeVersion<=3,"unsupported Luau type version "..c.typeVersion)
+    end
+
+    -- This order mirrors Luau's serialized loader (VM/src/lvmload.cpp):
+    -- version/type version, string table, userdata mapping, proto table.
     local ns=r:varint()
-    for i=1,ns do local n=r:varint(); c.strings[i]=r:bytes(n) end
+    for i=1,ns do
+        local n=r:varint()
+        c.strings[i]=r:bytes(n)
+    end
+
     if c.typeVersion==3 then
         c.userdataTypes={}
         local idx=r:u8()
-        while idx~=0 do local sid=r:varint(); c.userdataTypes[idx]=c.strings[sid]; idx=r:u8() end
+        while idx~=0 do
+            local sid=r:varint()
+            c.userdataTypes[idx]=c.strings[sid]
+            idx=r:u8()
+        end
     end
+
     local np=r:varint()
     local function str(id) return id==0 and nil or c.strings[id] end
     local protos={}
+
+    -- IMPORTANT: proto fields are serialized in this order:
+    -- header/typeinfo -> code -> constants -> child-proto references -> debug info.
+    -- The previous implementation read child references before code/constants,
+    -- which shifted the cursor and made string-table bytes look like opcodes.
     local function parseProto(id)
         local p={id=id,constants={},children={},locals={},upvalues={},strings=c.strings}
-        local start=r.p; local protoSize
+        local protoSize
+        local protoStart=r.p
         if c.bytecodeVersion>=12 then protoSize=r:varint() end
-        p.maxstack=r:u8(); p.numparams=r:u8(); p.nups=r:u8(); p.vararg=r:u8()~=0
+
+        p.maxstack=r:u8()
+        p.numparams=r:u8()
+        p.nups=r:u8()
+        p.vararg=r:u8()~=0
+
         if c.bytecodeVersion>=4 then
             p.flags=r:u8()
             local ts=r:varint()
             p.typeinfo=ts>0 and r:bytes(ts) or nil
         end
-        local nc=r:varint(); p.code={}
-        for pc=1,nc do p.code[pc]=decodeWord(r:u32()) end
+
+        local nc=r:varint()
+        p.code={}
+        for pc=1,nc do
+            p.code[pc]=decodeWord(r:u32())
+        end
+
         local nk=r:varint()
         for i=1,nk do
-            local tag=r:u8(); local k={tag=tag,type=CT[tag] or ("tag"..tag)}
+            local tag=r:u8()
+            local k={tag=tag,type=CT[tag] or ("tag"..tag)}
             if tag==0 then
-            elseif tag==1 then k.value=r:u8()~=0
-            elseif tag==2 then k.value=r:f64()
-            elseif tag==3 then k.value=str(r:varint()) or ""
+            elseif tag==1 then
+                k.value=r:u8()~=0
+            elseif tag==2 then
+                k.value=r:f64()
+            elseif tag==3 then
+                k.value=str(r:varint()) or ""
             elseif tag==4 then
-                k.id=r:u32(); local count=rshift(k.id,30); local a=band(rshift(k.id,20),1023); local b=band(rshift(k.id,10),1023); local d=band(k.id,1023)
+                k.id=r:u32()
+                local count=rshift(k.id,30)
+                local a=band(rshift(k.id,20),1023)
+                local b=band(rshift(k.id,10),1023)
+                local d=band(k.id,1023)
                 local q={}
                 if count>=1 then q[#q+1]=c.strings[a+1] or ("k"..a) end
                 if count>=2 then q[#q+1]=c.strings[b+1] or ("k"..b) end
                 if count>=3 then q[#q+1]=c.strings[d+1] or ("k"..d) end
                 k.path=table.concat(q,".")
             elseif tag==5 then
-                local n=r:varint(); k.keys={}; for j=1,n do k.keys[j]=r:varint() end
-            elseif tag==6 then k.proto=r:varint()
-            elseif tag==7 then k.x,k.y,k.z,k.w=r:f32(),r:f32(),r:f32(),r:f32()
+                local n=r:varint()
+                k.keys={}
+                for j=1,n do k.keys[j]=r:varint() end
+            elseif tag==6 then
+                k.proto=r:varint()
+            elseif tag==7 then
+                k.x,k.y,k.z,k.w=r:f32(),r:f32(),r:f32(),r:f32()
             elseif tag==8 then
-                local n=r:varint(); k.keys={}; k.values={}
-                for j=1,n do k.keys[j]=r:varint(); k.values[j]=r:i32() end
-            elseif tag==9 then local neg=r:u8()~=0; local m=r:varint64(); k.value=neg and -m or m
+                local n=r:varint()
+                k.keys={}; k.values={}
+                for j=1,n do
+                    k.keys[j]=r:varint()
+                    k.values[j]=r:i32()
+                end
+            elseif tag==9 then
+                local neg=r:u8()~=0
+                local m=r:varint64()
+                k.value=neg and -m or m
             elseif tag==10 then
-                k.classname=str(r:varint()) or "Class"; local props=r:varint(); local methods=r:varint(); k.members={}
+                k.classname=str(r:varint()) or "Class"
+                local props=r:varint()
+                local methods=r:varint()
+                k.members={}
                 for j=1,props+methods do k.members[j]=str(r:varint()) or ("member"..j) end
-            elseif tag==11 then k.x,k.y,k.z,k.w=r:f64(),r:f64(),r:f64(),r:f64()
-            else error("unknown Luau constant tag "..tag) end
+            elseif tag==11 then
+                k.x,k.y,k.z,k.w=r:f64(),r:f64(),r:f64(),r:f64()
+            else
+                error("unknown Luau constant tag "..tag)
+            end
             p.constants[i]=k
         end
-        local ch=r:varint(); for j=1,ch do p.children[j]=r:varint() end
-        p.linedefined=r:varint(); p.debugname=str(r:varint()) or ""
+
+        local ch=r:varint()
+        for j=1,ch do p.children[j]=r:varint() end
+
+        p.linedefined=r:varint()
+        p.debugname=str(r:varint()) or ""
+
         if r:u8()~=0 then
-            p.linegaplog2=r:u8(); local intervals=rshift((nc-1),p.linegaplog2)+1; p.lineinfo={}; local last=0
-            for pc=1,nc do last=band(last+r:u8(),0xff); p.lineinfo[pc]=last end
-            p.abslineinfo={}; for j=1,intervals do p.abslineinfo[j]=r:i32() end
+            p.linegaplog2=r:u8()
+            local intervals=((nc-1) >> p.linegaplog2)+1
+            p.lineinfo={}
+            local last=0
+            for pc=1,nc do
+                last=band(last+r:u8(),0xff)
+                p.lineinfo[pc]=last
+            end
+            p.abslineinfo={}
+            for j=1,intervals do p.abslineinfo[j]=r:i32() end
         end
+
         if r:u8()~=0 then
             local nl=r:varint()
-            for j=1,nl do p.locals[j]={name=str(r:varint()) or ("v"..j),startpc=r:varint(),endpc=r:varint(),reg=r:u8()} end
-            local nu=r:varint(); for j=1,nu do p.upvalues[j]=str(r:varint()) or ("up"..(j-1)) end
+            for j=1,nl do
+                p.locals[j]={name=str(r:varint()) or ("v"..j),startpc=r:varint(),endpc=r:varint(),reg=r:u8()}
+            end
+            local nu=r:varint()
+            for j=1,nu do p.upvalues[j]=str(r:varint()) or ("up"..(j-1)) end
         end
+
         if c.bytecodeVersion>=11 then
-            local nf=r:varint(); p.feedback={}
+            local nf=r:varint()
+            p.feedback={}
             for j=1,nf do p.feedback[j]={kind=r:u8(),pc=r:varint()} end
         end
-        if c.bytecodeVersion>=12 and band((p.flags or 0),8)~=0 then p.cost=r:varint64() end
-        if protoSize then r.p=start+protoSize end
+
+        if c.bytecodeVersion>=12 and band((p.flags or 0),8)~=0 then
+            p.cost=r:varint64()
+        end
+
+        if protoSize then
+            local expected=protoStart+protoSize
+            if r.p>expected then error("proto payload exceeded serialized proto size") end
+            r.p=expected
+        end
         return p
     end
+
     for i=1,np do protos[i]=parseProto(i) end
-    local main=r:varint(); c.protos=protos; c.main=protos[main+1]; if not c.main then error(("invalid main proto index %d (proto count %d)"):format(main,#protos)) end; c.bytesConsumed=r.p-1; c.trailing=r:remaining()
+
+    local main=r:varint()
+    c.protos=protos
+    c.main=protos[main+1]
+    if not c.main then error(("invalid main proto index %d (proto count %d)"):format(main,#protos)) end
+    c.bytesConsumed=r.p-1
+    c.trailing=r:remaining()
     return c
 end
 
@@ -333,7 +422,7 @@ end
 -- preserved as explicit IR nodes and reported diagnostically.
 -- ============================================================================
 
-m0pu.VERSION = "6.1.2"
+m0pu.VERSION = "6.1.3"
 
 local function push(t, v) t[#t+1] = v; return v end
 local function copyMap(s)
@@ -2034,8 +2123,8 @@ function m0pu.analyze(bytecode,options)
             ssaValues=x.ir.nextId,phis=0,loops=#x.loops,warnings=#x.diagnostics.warnings,
             confidence=x.confidence,irreducibleRegions=x.diagnostics.facts.irreducibleRegions or 0,
             shortCircuitRegions=x.diagnostics.facts.shortCircuitRegions or 0}
-        for _,b in ipairs(x.cfg.blocks) do r.protos[p.id].edges=edges+#b.successors end
-        for _,regs in pairs(x.ir.phis) do for _ in pairs(regs) do r.protos[p.id].phis=phis+1 end end
+        for _,b in ipairs(x.cfg.blocks) do r.protos[p.id].edges=r.protos[p.id].edges+#b.successors end
+        for _,regs in pairs(x.ir.phis) do for _ in pairs(regs) do r.protos[p.id].phis=r.protos[p.id].phis+1 end end
     end
     return r
 end
