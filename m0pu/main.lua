@@ -294,8 +294,8 @@ end
 
 
 -- ============================================================================
--- m0pu Decompiler v5 PRO
--- A deterministic Luau decompiler middle-end.
+-- m0pu
+-- Deterministic Luau decompiler middle-end.
 --
 -- Design:
 --   serialized bytecode
@@ -313,7 +313,7 @@ end
 -- preserved as explicit IR nodes and reported diagnostically.
 -- ============================================================================
 
-m0pu.VERSION = "6.1.0"
+m0pu.VERSION = "6.1.1"
 
 local function push(t, v) t[#t+1] = v; return v end
 local function copyMap(s)
@@ -1798,6 +1798,8 @@ end
 
 -- ------------------------------ diagnostics ---------------------------------
 
+local semanticCoverage
+
 local function diagnostics(p,g,ir,loops,struct)
     local d={errors={},warnings={},facts={}}
     local reach=reachable(g)
@@ -1935,7 +1937,7 @@ function m0pu.runRegression(options)
     return results
 end
 
-local function semanticCoverage(p)
+semanticCoverage = function(p)
     local seen={}; local unknown={}
     for _,i in ipairs(p.code or {}) do
         seen[i.name]=true
@@ -2032,7 +2034,7 @@ function m0pu.decompile(input,options)
     local c=prepare(data,options)
     local analyses={}
     -- Analyze children first so closure expression reconstruction can embed
-    -- their already-recovered bodies instead of a placeholder function.
+    -- their already-recovered bodies instead of fabricating a new body.
     for _,p in ipairs(c.protos or {}) do
         if p.id~=c.main.id then
             local ok,res=pcall(analyzeProto,p,options)
