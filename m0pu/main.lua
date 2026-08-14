@@ -5,7 +5,7 @@
 -- Original implementation; not copied from Oracle, Lua.Expert, Konstant, or Medal.
 
 local m0pu = {}
-m0pu.VERSION = "6.1.6"
+m0pu.VERSION = "6.1.7"
 m0pu.BYTECODE_MIN, m0pu.BYTECODE_MAX = 3, 12
 
 local bit32 = bit32
@@ -143,69 +143,18 @@ local OPCODES={"NOP",
 local function opname(i) return OPCODES[i+1] or ("OP_"..i) end
 local AUX={}
 for _,n in ipairs({
-    "GETGLOBAL","GETIMPORT","LOADKX","GETTABLEKS","SETTABLEKS","NAMECALL","NEWTABLE","SETLIST",
+    "GETGLOBAL","GETIMPORT","GETTABLEKS","SETTABLEKS","NAMECALL","NEWTABLE","SETLIST",
     "FORGLOOP","FASTCALL2","FASTCALL2K","FASTCALL3","JUMPXEQKNIL","JUMPXEQKB",
     "JUMPXEQKN","JUMPXEQKS","GETUDATAKS","SETUDATAKS","NAMECALLUDATA",
     "NEWCLASSMEMBER","CALLFB","CMPPROTO"
 }) do AUX[n]=true end
 local function oplen(n) return AUX[n] and 2 or 1 end
 
--- Roblox serializes Luau instructions with the standard Luau BytecodeEncoder
--- hook.  The opcode byte is multiplied by 227 modulo 256; 203 is the modular
--- inverse (227 * 203 == 1 mod 256).  Operands/AUX words are not transformed.
-local ROBLOX_OP_ENCODER = 227
-local ROBLOX_OP_DECODER = 203
-
-local function decodeOpcodeByte(op, robloxEncoded)
-    if robloxEncoded then
-        return band(op * ROBLOX_OP_DECODER, 0xff)
-    end
-    return op
-end
-
-local function decodeWord(w, robloxEncoded)
-    local rawop=band(w,0xff)
-    local op=decodeOpcodeByte(rawop, robloxEncoded)
-    local A=band(rshift(w,8),0xff)
-    local B=band(rshift(w,16),0xff)
-    local C=band(rshift(w,24),0xff)
+local function decodeWord(w)
+    local op=band(w,0xff); local A=band(rshift(w,8),0xff); local B=band(rshift(w,16),0xff); local C=band(rshift(w,24),0xff)
     local D=rshift(w,16); if D>=0x8000 then D=D-0x10000 end
     local E=rshift(w,8); if E>=0x800000 then E=E-0x1000000 end
-    return {word=w,rawop=rawop,op=op,name=opname(op),A=A,B=B,C=C,D=D,E=E,robloxEncoded=robloxEncoded}
-end
-
-local function scoreOpcodeEncoding(words, robloxEncoded)
-    local valid, invalid = 0, 0
-    local sample = math.min(#words, 64)
-    for i=1,sample do
-        local raw=band(words[i],0xff)
-        local op=decodeOpcodeByte(raw, robloxEncoded)
-        if op < #OPCODES then
-            valid += 1
-        else
-            invalid += 1
-        end
-    end
-    return valid, invalid
-end
-
-local function chooseOpcodeEncoding(words, options)
-    if options and options.roblox == true then
-        return true
-    end
-    if options and options.roblox == false then
-        return false
-    end
-
-    -- Auto-detect Roblox's opcode transform.  Vanilla Luau normally has a
-    -- very high valid-opcode ratio; Roblox's encoded stream does not.
-    local rv, ri = scoreOpcodeEncoding(words, false)
-    local bv, bi = scoreOpcodeEncoding(words, true)
-
-    if bv > rv and (bv - rv) >= 2 then
-        return true
-    end
-    return false
+    return {word=w,op=op,name=opname(op),A=A,B=B,C=C,D=D,E=E}
 end
 local function aux(w)
     return {raw=w,A=band(w,0xff),B=band(rshift(w,8),0xff),C=band(rshift(w,16),0xff),KV=band(w,0xffffff),
@@ -239,177 +188,80 @@ local function parseLuau(data,options)
     local c={format="LuauSerialized",bytecodeVersion=r:u8(),typeVersion=0,strings={},protos={},warnings={}}
     if c.bytecodeVersion==0 then c.error=r:bytes(r:remaining()); return c end
     assert(c.bytecodeVersion>=3 and c.bytecodeVersion<=12,"unsupported Luau bytecode version "..c.bytecodeVersion)
-    if c.bytecodeVersion>=4 then
-        c.typeVersion=r:u8()
-        assert(c.typeVersion>=1 and c.typeVersion<=3,"unsupported Luau type version "..c.typeVersion)
-    end
-
-    -- This order mirrors Luau's serialized loader (VM/src/lvmload.cpp):
-    -- version/type version, string table, userdata mapping, proto table.
+    if c.bytecodeVersion>=4 then c.typeVersion=r:u8(); assert(c.typeVersion>=1 and c.typeVersion<=3,"unsupported Luau type version "..c.typeVersion) end
     local ns=r:varint()
-    for i=1,ns do
-        local n=r:varint()
-        c.strings[i]=r:bytes(n)
-    end
-
+    for i=1,ns do local n=r:varint(); c.strings[i]=r:bytes(n) end
     if c.typeVersion==3 then
         c.userdataTypes={}
         local idx=r:u8()
-        while idx~=0 do
-            local sid=r:varint()
-            c.userdataTypes[idx]=c.strings[sid]
-            idx=r:u8()
-        end
+        while idx~=0 do local sid=r:varint(); c.userdataTypes[idx]=c.strings[sid]; idx=r:u8() end
     end
-
     local np=r:varint()
     local function str(id) return id==0 and nil or c.strings[id] end
     local protos={}
-
-    -- IMPORTANT: proto fields are serialized in this order:
-    -- header/typeinfo -> code -> constants -> child-proto references -> debug info.
-    -- The previous implementation read child references before code/constants,
-    -- which shifted the cursor and made string-table bytes look like opcodes.
     local function parseProto(id)
         local p={id=id,constants={},children={},locals={},upvalues={},strings=c.strings}
-        local protoSize
-        local protoStart=r.p
+        local start=r.p; local protoSize
         if c.bytecodeVersion>=12 then protoSize=r:varint() end
-
-        p.maxstack=r:u8()
-        p.numparams=r:u8()
-        p.nups=r:u8()
-        p.vararg=r:u8()~=0
-
+        p.maxstack=r:u8(); p.numparams=r:u8(); p.nups=r:u8(); p.vararg=r:u8()~=0
         if c.bytecodeVersion>=4 then
             p.flags=r:u8()
             local ts=r:varint()
             p.typeinfo=ts>0 and r:bytes(ts) or nil
         end
-
-        local nc=r:varint()
-        p.code={}
-        local rawCode={}
-        for pc=1,nc do
-            rawCode[pc]=r:u32()
-        end
-
-        local robloxEncoded=chooseOpcodeEncoding(rawCode,options)
-        p.robloxEncoded=robloxEncoded
-        p.codeEncoding=robloxEncoded and "RobloxOpcodeEncoder(227)" or "LuauNative"
-        for pc=1,nc do
-            p.code[pc]=decodeWord(rawCode[pc],robloxEncoded)
-        end
-
+        local nc=r:varint(); p.code={}
+        for pc=1,nc do p.code[pc]=decodeWord(r:u32()) end
         local nk=r:varint()
         for i=1,nk do
-            local tag=r:u8()
-            local k={tag=tag,type=CT[tag] or ("tag"..tag)}
+            local tag=r:u8(); local k={tag=tag,type=CT[tag] or ("tag"..tag)}
             if tag==0 then
-            elseif tag==1 then
-                k.value=r:u8()~=0
-            elseif tag==2 then
-                k.value=r:f64()
-            elseif tag==3 then
-                k.value=str(r:varint()) or ""
+            elseif tag==1 then k.value=r:u8()~=0
+            elseif tag==2 then k.value=r:f64()
+            elseif tag==3 then k.value=str(r:varint()) or ""
             elseif tag==4 then
-                k.id=r:u32()
-                local count=rshift(k.id,30)
-                local a=band(rshift(k.id,20),1023)
-                local b=band(rshift(k.id,10),1023)
-                local d=band(k.id,1023)
+                k.id=r:u32(); local count=rshift(k.id,30); local a=band(rshift(k.id,20),1023); local b=band(rshift(k.id,10),1023); local d=band(k.id,1023)
                 local q={}
                 if count>=1 then q[#q+1]=c.strings[a+1] or ("k"..a) end
                 if count>=2 then q[#q+1]=c.strings[b+1] or ("k"..b) end
                 if count>=3 then q[#q+1]=c.strings[d+1] or ("k"..d) end
                 k.path=table.concat(q,".")
             elseif tag==5 then
-                local n=r:varint()
-                k.keys={}
-                for j=1,n do k.keys[j]=r:varint() end
-            elseif tag==6 then
-                k.proto=r:varint()
-            elseif tag==7 then
-                k.x,k.y,k.z,k.w=r:f32(),r:f32(),r:f32(),r:f32()
+                local n=r:varint(); k.keys={}; for j=1,n do k.keys[j]=r:varint() end
+            elseif tag==6 then k.proto=r:varint()
+            elseif tag==7 then k.x,k.y,k.z,k.w=r:f32(),r:f32(),r:f32(),r:f32()
             elseif tag==8 then
-                local n=r:varint()
-                k.keys={}; k.values={}
-                for j=1,n do
-                    k.keys[j]=r:varint()
-                    k.values[j]=r:i32()
-                end
-            elseif tag==9 then
-                local neg=r:u8()~=0
-                local m=r:varint64()
-                k.value=neg and -m or m
+                local n=r:varint(); k.keys={}; k.values={}
+                for j=1,n do k.keys[j]=r:varint(); k.values[j]=r:i32() end
+            elseif tag==9 then local neg=r:u8()~=0; local m=r:varint64(); k.value=neg and -m or m
             elseif tag==10 then
-                k.classname=str(r:varint()) or "Class"
-                local props=r:varint()
-                local methods=r:varint()
-                k.members={}
+                k.classname=str(r:varint()) or "Class"; local props=r:varint(); local methods=r:varint(); k.members={}
                 for j=1,props+methods do k.members[j]=str(r:varint()) or ("member"..j) end
-            elseif tag==11 then
-                k.x,k.y,k.z,k.w=r:f64(),r:f64(),r:f64(),r:f64()
-            else
-                error("unknown Luau constant tag "..tag)
-            end
+            elseif tag==11 then k.x,k.y,k.z,k.w=r:f64(),r:f64(),r:f64(),r:f64()
+            else error("unknown Luau constant tag "..tag) end
             p.constants[i]=k
         end
-
-        local ch=r:varint()
-        for j=1,ch do p.children[j]=r:varint() end
-
-        p.linedefined=r:varint()
-        p.debugname=str(r:varint()) or ""
-
+        local ch=r:varint(); for j=1,ch do p.children[j]=r:varint() end
+        p.linedefined=r:varint(); p.debugname=str(r:varint()) or ""
         if r:u8()~=0 then
-            p.linegaplog2=r:u8()
-            local intervals=math.floor((nc-1)/(2 ^ p.linegaplog2))+1
-            p.lineinfo={}
-            local last=0
-            for pc=1,nc do
-                last=band(last+r:u8(),0xff)
-                p.lineinfo[pc]=last
-            end
-            p.abslineinfo={}
-            for j=1,intervals do p.abslineinfo[j]=r:i32() end
+            p.linegaplog2=r:u8(); local intervals=rshift((nc-1),p.linegaplog2)+1; p.lineinfo={}; local last=0
+            for pc=1,nc do last=band(last+r:u8(),0xff); p.lineinfo[pc]=last end
+            p.abslineinfo={}; for j=1,intervals do p.abslineinfo[j]=r:i32() end
         end
-
         if r:u8()~=0 then
             local nl=r:varint()
-            for j=1,nl do
-                p.locals[j]={name=str(r:varint()) or ("v"..j),startpc=r:varint(),endpc=r:varint(),reg=r:u8()}
-            end
-            local nu=r:varint()
-            for j=1,nu do p.upvalues[j]=str(r:varint()) or ("up"..(j-1)) end
+            for j=1,nl do p.locals[j]={name=str(r:varint()) or ("v"..j),startpc=r:varint(),endpc=r:varint(),reg=r:u8()} end
+            local nu=r:varint(); for j=1,nu do p.upvalues[j]=str(r:varint()) or ("up"..(j-1)) end
         end
-
         if c.bytecodeVersion>=11 then
-            local nf=r:varint()
-            p.feedback={}
+            local nf=r:varint(); p.feedback={}
             for j=1,nf do p.feedback[j]={kind=r:u8(),pc=r:varint()} end
         end
-
-        if c.bytecodeVersion>=12 and band((p.flags or 0),8)~=0 then
-            p.cost=r:varint64()
-        end
-
-        if protoSize then
-            local expected=protoStart+protoSize
-            if r.p>expected then error("proto payload exceeded serialized proto size") end
-            r.p=expected
-        end
+        if c.bytecodeVersion>=12 and band((p.flags or 0),8)~=0 then p.cost=r:varint64() end
+        if protoSize then r.p=start+protoSize end
         return p
     end
-
     for i=1,np do protos[i]=parseProto(i) end
-
-    local main=r:varint()
-    c.protos=protos
-    c.main=protos[main+1]
-    if not c.main then error(("invalid main proto index %d (proto count %d)"):format(main,#protos)) end
-    c.bytesConsumed=r.p-1
-    c.trailing=r:remaining()
+    local main=r:varint(); c.protos=protos; c.main=protos[main+1]; if not c.main then error(("invalid main proto index %d (proto count %d)"):format(main,#protos)) end; c.bytesConsumed=r.p-1; c.trailing=r:remaining()
     return c
 end
 
@@ -481,7 +333,7 @@ end
 -- preserved as explicit IR nodes and reported diagnostically.
 -- ============================================================================
 
-m0pu.VERSION = "6.1.6"
+m0pu.VERSION = "6.1.7"
 
 local function push(t, v) t[#t+1] = v; return v end
 local function copyMap(s)
@@ -514,7 +366,7 @@ end
 local R = function(...) return {...} end
 for _,n in ipairs({"LOADNIL","LOADB","LOADN","LOADK","LOADKX","GETGLOBAL","GETUPVAL",
     "GETIMPORT","GETTABLE","GETTABLEKS","GETUDATAKS","GETTABLEN","NEWTABLE","DUPTABLE",
-    "NEWCLOSURE","DUPCLOSURE","GETVARARGS",
+    "NEWCLOSURE","DUPCLOSURE","NAMECALL","NAMECALLUDATA","GETVARARGS",
     "ADD","SUB","MUL","DIV","MOD","POW","IDIV","AND","OR","ADDK","SUBK","MULK",
     "DIVK","MODK","POWK","IDIVK","ANDK","ORK","SUBRK","DIVRK","CONCAT","NOT","MINUS",
     "LENGTH","CALL","CALLFB"}) do
@@ -952,6 +804,15 @@ local function writes(i)
         local count=(i.C==0) and 1 or math.max(1,i.C-1)
         for r=i.A,i.A+count-1 do out[#out+1]=r end
         return out
+    elseif n=="FORGLOOP" then
+        local count=1
+        if i.aux and i.aux.raw then
+            count=band(i.aux.raw,0xff)
+            if count<1 then count=1 end
+        end
+        local out={}
+        for r=i.A+3,i.A+2+count do out[#out+1]=r end
+        return out
     elseif n=="GETVARARGS" then
         local out={}
         local count=(i.B==0) and 1 or math.max(1,i.B-1)
@@ -1048,54 +909,20 @@ function IR:lift(i,st,b)
     elseif n=="DUPCLOSURE" then
         DEF(A,self:value("closure",{constant=D,kind="dup",captures={}}))
     elseif n=="NAMECALL" or n=="NAMECALLUDATA" then
-        -- NAMECALL is VM call preparation, not a source-level assignment.
-        -- Luau prepares the method in A and copies the receiver to A+1, then
-        -- CALL consumes that prepared pair.  Keeping this as a pending semantic
-        -- record prevents the old (and incorrect) "game:GetService()(... )"
-        -- reconstruction and also prevents NAMECALL from poisoning SSA state.
-        self.pendingMethods=self.pendingMethods or {}
-        self.pendingMethods[i.pc]={
-            receiver=V(B),
-            method=self:const(aux and (aux.KV16 or aux.KV) or 0),
-            argBase=A+2,
-            preparedSelf=A+1,
-            pc=i.pc,
-            userdata=(n=="NAMECALLUDATA")
-        }
-        emit("method_prepare",{kind="method_prepare",pc=i.pc,block=b.id,op=n,A=A,B=B,aux=aux,
-            receiver=V(B),method=self.pendingMethods[i.pc].method})
+        DEF(A,self:op("methodcall",{V(B),self:const(aux.KV)},b.id,i.pc,{argBase=A+2,argCount=B}))
     elseif n=="CALL" or n=="CALLFB" then
-        local pending=self.pendingMethods and self.pendingMethods[i.pc-2]
-        local args={}
-        local opName="call"
-        local extra={multi=(C==0) or C>2,index=0,count=(C==0) and 1 or math.max(1,C-1)}
-        if pending then
-            -- B is argument count + 1 and includes the implicit receiver copied
-            -- by NAMECALL into A+1.  Source arguments therefore begin at A+2.
-            for r=A+2,A+B-1 do args[#args+1]=V(r) end
-            opName="methodcall"
-            extra.receiver=pending.receiver
-            extra.method=pending.method
-            extra.argBase=A+2
-            extra.argCount=(B==0) and -1 or math.max(0,B-2)
-            extra.userdata=pending.userdata
-        else
-            args={V(A)}
-            if B>1 then for r=A+1,A+B-1 do args[#args+1]=V(r) end end
-        end
+        local args={V(A)}
+        if B>1 then for r=A+1,A+B-1 do args[#args+1]=V(r) end end
         local count=(C==0) and 1 or math.max(1,C-1)
+        local call=self:op("call",args,b.id,i.pc,{multi=count>1,index=0,count=count})
         for r=0,count-1 do
-            local callArgs=args
-            local callExtra={}
-            for k,v in pairs(extra) do callExtra[k]=v end
-            callExtra.multi=count>1; callExtra.index=r; callExtra.count=count
-            if pending then
-                callArgs={pending.receiver}
-                for _,a in ipairs(args) do callArgs[#callArgs+1]=a end
+            local result=call
+            if r>0 then
+                result=self:value("call_result",{call=call,index=r,count=count})
+                self:use(call,{block=b.id,pc=i.pc,role="result_tuple"})
             end
-            DEF(A+r,self:op(opName,callArgs,b.id,i.pc,callExtra))
+            DEF(A+r,result)
         end
-        if pending then self.pendingMethods[i.pc-2]=nil end
     elseif n=="GETVARARGS" then DEF(A,self:value("varargs",{block=b.id,pc=i.pc,count=B}))
     elseif n=="CONCAT" then
         local args={}; for r=B,C do args[#args+1]=V(r) end
@@ -1373,19 +1200,6 @@ local function recoverShortCircuit(g,ir)
     return ir
 end
 
-local function loopExit(g,l)
-    local member={}
-    for _,x in ipairs(l.members) do member[x]=true end
-    for _,x in ipairs(l.members) do
-        local block=g.blocks[x]
-        if block then
-            for _,s in ipairs(block.successors) do
-                if not member[s] then return s end
-            end
-        end
-    end
-end
-
 local function loopShape(g,loops,ipdom)
     local shapes={}
     for _,l in ipairs(loops) do
@@ -1397,6 +1211,15 @@ local function loopShape(g,loops,ipdom)
             shape.kind="numeric"; shape.reg=prep.A
         elseif prep and (prep.name=="FORGPREP" or prep.name=="FORGPREP_INEXT" or prep.name=="FORGPREP_NEXT") then
             shape.kind="generic"; shape.reg=prep.A
+            shape.iteratorPc=prep.pc
+            local li=latch and latch.instructions[#latch.instructions]
+            local count=1
+            if li and li.name=="FORGLOOP" and li.aux and li.aux.raw then
+                count=band(li.aux.raw,0xff)
+                if count<1 then count=1 end
+            end
+            shape.varCount=count
+            shape.varBase=prep.A+3
         elseif latch then
             local li=latch.instructions[#latch.instructions]
             local target=li and branchTarget(li.pc,li)
@@ -1498,6 +1321,19 @@ local function normalizeIR(ir,g,loops,ipdom)
     expressionDag(ir)
     recoverShortCircuit(g,ir)
     ir.loopShapes=loopShape(g,loops,ipdom)
+    for header,shape in pairs(ir.loopShapes) do
+        if shape.kind=="generic" then
+            local prep=g.blocks[header] and g.blocks[header].instructions[1]
+            if prep then
+                local st=ir.stateBefore[prep.pc] or ir.inState[header] or {}
+                shape.iteratorValue=st[shape.reg]
+                shape.iteratorState=st[shape.reg+1]
+                shape.iteratorIndex=st[shape.reg+2]
+                shape.varRegisters={}
+                for j=0,(shape.varCount or 1)-1 do shape.varRegisters[#shape.varRegisters+1]=shape.varBase+j end
+            end
+        end
+    end
     ir.irreducible=irreducibleRegions(g,ir.dominators or {})
     return ir
 end
@@ -1555,6 +1391,10 @@ local function astValue(v,p,names,seen)
         return e
     end
     if v.kind=="varargs" or v.kind=="vararg_return" then return AST.id("...") end
+    if v.kind=="call_result" then
+        local base=astValue(d.call,p,names,seen)
+        return AST.call(AST.id("select"),{AST.literal(tostring((d.index or 0)+1)),base})
+    end
     if v.kind=="table" then return AST.table({}) end
     if v.kind=="closure" then return AST.raw("function(...) end") end
     if v.kind=="phi" then return AST.id(names[d.reg] or ("v"..v.id)) end
@@ -1568,20 +1408,9 @@ local function astValue(v,p,names,seen)
             if identifier(key) then return AST.field(a[1],key) end
             return AST.index(a[1],AST.literal(string.format("%q",key)))
         elseif d.op=="methodcall" then
-            local methodValue=d.extra and d.extra.method
-            local key=(methodValue and methodValue.data and methodValue.data.text) or "method"
+            local key=(d.args[2] and d.args[2].data and d.args[2].data.text) or "method"
             key=key:gsub('^"(.*)"$','%1')
-            -- NAMECALL's receiver is represented separately from the explicit
-            -- arguments.  Use fresh expression-visit sets here so the receiver
-            -- isn't turned into a synthetic v<ID> merely because it was also
-            -- present as the first SSA operand.
-            local receiver=d.extra and d.extra.receiver or d.args[1]
-            local receiverAst=astValue(receiver,p,names,{})
-            local methodArgs={}
-            for j=2,#(d.args or {}) do
-                methodArgs[#methodArgs+1]=astValue(d.args[j],p,names,{})
-            end
-            return AST.method(receiverAst,key,methodArgs)
+            return AST.method(a[1],key,{})
         elseif d.op=="call" then
             local fn=a[1]; local args={}
             for j=2,#a do args[#args+1]=a[j] end
@@ -1644,6 +1473,16 @@ local function blockLoopMap(loops)
         end
     end
     return m
+end
+
+local function loopExit(g,l)
+    local member={}
+    for _,x in ipairs(l.members) do member[x]=true end
+    for _,x in ipairs(l.members) do
+        for _,s in ipairs(g.blocks[x].successors) do
+            if not member[s] then return s end
+        end
+    end
 end
 
 local function regions(g,pdom,ipdom,loops)
@@ -1771,7 +1610,7 @@ function Structurer:emitBlockInstructions(b)
             -- FASTCALL is an optimization hint; the following CALL is the
             -- semantic operation.  Do not emit the hint.
         elseif n=="CAPTURE" or n=="PREPVARARGS" or n=="COVERAGE" or n=="NATIVECALL" or
-               n=="NOP" or n=="BREAK" or n=="CLOSEUPVALS" or n=="NAMECALL" or n=="NAMECALLUDATA" then
+               n=="NOP" or n=="BREAK" or n=="CLOSEUPVALS" then
             -- No source-level statement.
         elseif n:match("^JUMP") or n:match("^FOR") or isConditional(n and ins) or n=="CMPPROTO" then
             -- consumed by region recovery.
@@ -1849,19 +1688,15 @@ function Structurer:walk(id,stop,depth,active,pr)
             local var=self.names[r+3] or index
             pline(pr,"for "..var.." = "..index..", "..limit..", "..step.." do")
         elseif shape.kind=="generic" and prep then
-            local r=prep.A
-            local gen=self.names[r] or ("t"..r)
-            local state=self.names[r+1] or ("t"..(r+1))
-            local index=self.names[r+2] or ("t"..(r+2))
-            local count=1
-            local latch=g.blocks[loop.latch]
-            local li=latch and latch.instructions[#latch.instructions]
-            if li and li.name=="FORGLOOP" then count=(li.aux and (band(li.aux.raw,0xff))) or 1 end
+            local count=shape.varCount or 1
             local vars={}
-            for j=0,count-1 do vars[#vars+1]=self.names[r+3+j] or ("t"..(r+3+j)) end
-            -- The VM keeps generator/state/index in hidden registers; source
-            -- syntax only exposes the iteration variables and expression.
-            pline(pr,"for "..table.concat(vars,", ").." in "..gen..", "..state..", "..index.." do")
+            for j=1,count do
+                local r=(shape.varRegisters and shape.varRegisters[j]) or (prep.A+2+j)
+                vars[#vars+1]=self.names[r] or ("t"..r)
+            end
+            local iter=shape.iteratorValue
+            local iterText=iter and printAST(astValue(iter,self.p,self.names)) or (self.names[prep.A] or ("t"..prep.A))
+            pline(pr,"for "..table.concat(vars,", ").." in "..iterText.." do")
         elseif shape.kind=="repeat" then
             pline(pr,"repeat")
         else
@@ -2211,7 +2046,7 @@ function m0pu.disassemble(bytecode,options)
     local c=parseAny(bytecode,options or {})
     local out={"-- m0pu "..m0pu.VERSION.." | "..c.format.." | bytecode "..c.bytecodeVersion}
     for _,p in ipairs(c.protos or {}) do
-        out[#out+1]="-- proto "..p.id.." "..quote(p.debugname or "").." | encoding="..tostring(p.codeEncoding or "unknown")
+        out[#out+1]="-- proto "..p.id.." "..quote(p.debugname or "")
         local pc=1
         while pc<=#p.code do
             local i=p.code[pc]
