@@ -1824,7 +1824,7 @@ local function diagnostics(p,g,ir,loops,struct)
 end
 
 local function confidence(g,ir,loops,struct,d)
-    local total=#g.blocks+#loops+#d.facts.ssaValues
+    local total=#g.blocks+#loops+(d.facts.ssaValues or 0)
     local good=0
     for _,b in ipairs(g.blocks) do
         if #b.successors<=2 then good=good+1 end
